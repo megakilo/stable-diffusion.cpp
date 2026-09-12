@@ -50,7 +50,10 @@ static bool is_disk_backend_token(const std::string& name) {
     return lower_copy(trim_copy(name)) == "disk";
 }
 
-static bool parse_backend_module(const std::string& raw_name, SDBackendModule* module) {
+bool sd_parse_backend_module(const std::string& raw_name, SDBackendModule* module) {
+    if (module == nullptr) {
+        return false;
+    }
     std::string name = lower_copy(trim_copy(raw_name));
     name.erase(std::remove(name.begin(), name.end(), '-'), name.end());
     name.erase(std::remove(name.begin(), name.end(), '_'), name.end());
@@ -632,7 +635,7 @@ static bool sd_parse_backend_assignment(const std::string& spec, SDBackendAssign
         }
 
         SDBackendModule module = SDBackendModule::DIFFUSION;
-        if (!parse_backend_module(key, &module)) {
+        if (!sd_parse_backend_module(key, &module)) {
             if (error != nullptr) {
                 *error = "unknown backend module '" + key + "'";
             }

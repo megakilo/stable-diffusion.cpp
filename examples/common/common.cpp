@@ -516,6 +516,19 @@ ArgOptions SDContextParams::get_options() {
          (int)',',
          &split_mode},
         {"",
+         "--split-ratio",
+         "target parameter split ratio across devices for multi-device modules (--backend \"diffusion=cuda0&cuda1\"). "
+         "Accepts positional ratios (e.g. 2:1), device-targeted ratios (e.g. cuda0:2,cuda1:1), or per-module assignments "
+         "(e.g. diffusion=1:1,te=2:1). In layer split mode, partitions layers to nearest discrete boundary to match ratio "
+         "while respecting VRAM limits. Defaults to greedy capacity fill if unset.",
+         (int)',',
+         &split_ratio},
+        {"",
+         "--layer-split-ratio",
+         "alias of --split-ratio",
+         (int)',',
+         &split_ratio},
+        {"",
          "--rpc-servers",
          "comma-separated list of RPC servers to connect to for offloading, in the format host:port, e.g. localhost:50052,192.168.1.3:50052",
          (int)',',
@@ -878,6 +891,7 @@ std::string SDContextParams::to_string() const {
         << "  backend: \"" << backend << "\",\n"
         << "  params_backend: \"" << params_backend << "\",\n"
         << "  split_mode: \"" << split_mode << "\",\n"
+        << "  split_ratio: \"" << split_ratio << "\",\n"
         << "  model_args: \"" << model_args << "\",\n"
         << "  auto_fit: " << (auto_fit ? "true" : "false") << ",\n"
         << "  enable_mmap: " << (enable_mmap ? "true" : "false") << ",\n"
@@ -951,6 +965,7 @@ sd_ctx_params_t SDContextParams::to_sd_ctx_params_t(bool taesd_preview) {
     sd_ctx_params.backend                         = effective_backend.c_str();
     sd_ctx_params.params_backend                  = effective_params_backend.c_str();
     sd_ctx_params.split_mode                      = split_mode.c_str();
+    sd_ctx_params.split_ratio                     = split_ratio.empty() ? nullptr : split_ratio.c_str();
     sd_ctx_params.auto_fit                        = auto_fit;
     sd_ctx_params.rpc_servers                     = rpc_servers.c_str();
     sd_ctx_params.model_args                      = model_args.empty() ? nullptr : model_args.c_str();

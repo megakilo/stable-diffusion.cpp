@@ -240,6 +240,7 @@ typedef struct {
     const char* rpc_servers;
     const char* model_args;
     bool disable_segmented_compute;  // Force monolithic graph execution even when automatic graph cutting would fit memory better
+    const char* split_ratio;  // Device split ratios for multi-device modules: e.g. "cuda0:2,cuda1:1", "1:1", or per-module "diffusion=1:1,te=2:1"
 } sd_ctx_params_t;
 
 typedef struct {

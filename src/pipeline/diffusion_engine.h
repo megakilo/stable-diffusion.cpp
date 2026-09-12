@@ -14,6 +14,7 @@
 
 #include "core/ggml_extend_backend.h"
 #include "core/ggml_graph_cut.h"
+#include "core/layer_split_partition.h"
 #include "core/tensor.hpp"
 #include "core/util.h"
 #include "model/adapter/lora.hpp"
@@ -93,6 +94,8 @@ public:
     std::string backend_spec;
     std::string params_backend_spec;
     std::string split_mode_spec;
+    std::string split_ratio_spec;
+    sd::SDSplitRatioAssignment split_ratio_assignment;
     bool auto_fit_enabled = false;
 
     bool diffusion_conv_direct = false;
@@ -250,6 +253,9 @@ public:
     size_t max_graph_vram_bytes_for_module(SDBackendModule module);
 
     std::vector<size_t> layer_split_vram_limits_for_backends(const std::vector<ggml_backend_t>& backends);
+    bool layer_split_ratios_for_backends(SDBackendModule module,
+                                         const std::vector<ggml_backend_t>& backends,
+                                         std::vector<float>* ratios) const;
 
     bool ensure_backend_pair(SDBackendModule module);
 

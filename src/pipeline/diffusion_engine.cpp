@@ -323,6 +323,17 @@ std::vector<size_t> StableDiffusionGGML::layer_split_vram_limits_for_backends(co
     return limits;
 }
 
+bool StableDiffusionGGML::layer_split_ratios_for_backends(SDBackendModule module,
+                                                         const std::vector<ggml_backend_t>& backends,
+                                                         std::vector<float>* ratios) const {
+    std::string error;
+    if (!split_ratio_assignment.ratios_for_backends(module, backends, ratios, &error)) {
+        LOG_ERROR("%s", error.c_str());
+        return false;
+    }
+    return true;
+}
+
 bool StableDiffusionGGML::ensure_backend_pair(SDBackendModule module) {
     if (backend_for(module) == nullptr) {
         return false;
@@ -420,7 +431,12 @@ bool StableDiffusionGGML::register_row_split_runner_params(ModelComponent compon
     const size_t reg_dev_count = ggml_backend_reg_dev_count(reg);
     std::vector<float> tensor_split(reg_dev_count, 0.0f);
     constexpr int64_t compute_headroom_bytes = 2ll * 1024 * 1024 * 1024;
-    for (ggml_backend_t backend : module_backends) {
+    std::vector<float> custom_ratios;
+    if (!layer_split_ratios_for_backends(module, module_backends, &custom_ratios)) {
+        return false;
+    }
+    for (size_t b_idx = 0; b_idx < module_backends.size(); ++b_idx) {
+        ggml_backend_t backend = module_backends[b_idx];
         ggml_backend_dev_t dev = ggml_backend_get_device(backend);
         int reg_index          = -1;
         for (size_t i = 0; i < reg_dev_count; i++) {
@@ -432,11 +448,15 @@ bool StableDiffusionGGML::register_row_split_runner_params(ModelComponent compon
         if (reg_index < 0) {
             return fall_back_to_layer_split("devices span different backend registries");
         }
-        size_t free_bytes = 0, total_bytes = 0;
-        ggml_backend_dev_memory(dev, &free_bytes, &total_bytes);
-        int64_t usable_bytes    = std::max<int64_t>((int64_t)free_bytes - compute_headroom_bytes,
-                                                 (int64_t)free_bytes / 8);
-        tensor_split[reg_index] = usable_bytes > 0 ? (float)((double)usable_bytes / (1024.0 * 1024.0)) : 1.0f;
+        if (!custom_ratios.empty()) {
+            tensor_split[reg_index] = b_idx < custom_ratios.size() ? custom_ratios[b_idx] : 0.0f;
+        } else {
+            size_t free_bytes = 0, total_bytes = 0;
+            ggml_backend_dev_memory(dev, &free_bytes, &total_bytes);
+            int64_t usable_bytes    = std::max<int64_t>((int64_t)free_bytes - compute_headroom_bytes,
+                                                     (int64_t)free_bytes / 8);
+            tensor_split[reg_index] = usable_bytes > 0 ? (float)((double)usable_bytes / (1024.0 * 1024.0)) : 1.0f;
+        }
     }
 
     ggml_backend_buffer_type_t split_buft = backend_manager.split_buffer_type(main_backend, tensor_split);
@@ -538,6 +558,11 @@ bool StableDiffusionGGML::register_layer_split_runner_params(ModelComponent comp
 
     model->set_runtime_backends(module_backends);
     model->set_graph_cut_layer_split_backend_vram_limits(layer_split_vram_limits_for_backends(module_backends));
+    std::vector<float> split_ratios;
+    if (!layer_split_ratios_for_backends(module, module_backends, &split_ratios)) {
+        return false;
+    }
+    model->set_graph_cut_layer_split_ratios(split_ratios);
     model->set_graph_cut_layer_split_enabled(true);
     const bool params_follow_runtime = backend_manager.params_backend_follows_runtime(module) ||
                                        backend_manager.params_backend_is_disk(module);
@@ -852,11 +877,19 @@ bool StableDiffusionGGML::init(const sd_ctx_params_t* sd_ctx_params) {
     backend_spec              = SAFE_STR(sd_ctx_params->backend);
     params_backend_spec       = SAFE_STR(sd_ctx_params->params_backend);
     split_mode_spec           = SAFE_STR(sd_ctx_params->split_mode);
+    split_ratio_spec          = SAFE_STR(sd_ctx_params->split_ratio);
     auto_fit_enabled          = sd_ctx_params->auto_fit && backend_spec.empty() && params_backend_spec.empty();
     max_vram_assignment.reset(0.f);
     {
         std::string error;
         if (!max_vram_assignment.parse(SAFE_STR(sd_ctx_params->max_vram), &error)) {
+            LOG_ERROR("%s", error.c_str());
+            return false;
+        }
+    }
+    if (!split_ratio_spec.empty()) {
+        std::string error;
+        if (!split_ratio_assignment.parse(split_ratio_spec, &error)) {
             LOG_ERROR("%s", error.c_str());
             return false;
         }

@@ -126,6 +126,36 @@ Direct ("immediately") LoRA application cannot patch row-split tensors; with
 explicit `--lora-apply-mode immediately` skips the split tensors with a
 warning.
 
+### Split ratio control (`--split-ratio` / `--layer-split-ratio`)
+
+When distributing a module across multiple devices (`--backend "diffusion=cuda0&cuda1"`), by default `stable-diffusion.cpp` performs a greedy fill: it packs as many layers as fit into the primary device's remaining VRAM before spilling remaining layers onto subsequent devices.
+
+If the primary device has heavy compute buffer or workspace requirements (e.g. attention scratch space), greedy packing can leave insufficient VRAM on the primary device for execution, even when secondary devices have ample free memory.
+
+`--split-ratio` (or `--layer-split-ratio`) provides fine-grained control over weight distribution across devices:
+
+- **Positional ratios**: specify proportions matching the device order given in `--backend`:
+  ```shell
+  # 1:1 ratio between cuda0 and cuda1 (50% each)
+  sd-cli -m model.safetensors -p "a cat" --backend "diffusion=cuda0&cuda1" --split-ratio 1:1
+
+  # 2:1 ratio (66.7% on cuda1, 33.3% on cuda0)
+  sd-cli -m model.safetensors -p "a cat" --backend "diffusion=cuda1&cuda0" --split-ratio 2:1
+  ```
+- **Device-targeted ratios**: specify proportions by device name (using `cuda0` or `cuda:0`):
+  ```shell
+  sd-cli -m model.safetensors -p "a cat" --backend "diffusion=cuda0&cuda1" --split-ratio cuda0:1,cuda1:1
+  ```
+- **Per-module assignments**: specify ratios for individual modules (commas separate modules; use `/` or `&` to separate devices within a module):
+  ```shell
+  sd-cli -m model.safetensors -p "a cat" --backend "diffusion=cuda0&cuda1,te=cuda0&cuda1" --split-ratio diffusion=1:1,te=2:1
+  sd-cli -m model.safetensors -p "a cat" --backend "diffusion=cuda0&cuda1,te=cuda0&cuda1" --split-ratio diffusion=cuda0:2/cuda1:1,te=cuda0:1/cuda1:2
+  ```
+
+Within ratio lists, `:`, `/`, or `&` can be used interchangeably as separators.
+
+In **layer split mode**, layers are assigned as contiguous per-device slices in `--backend` order. Cut points are chosen at transformer-block boundaries to match the target parameter-byte ratio while strictly obeying each device's available VRAM. If the requested ratio cannot fit, setup fails instead of falling back to greedy fill. In **row split mode**, the ratio sets the row-split buffer weights across devices and is not mixed with VRAM-based weights. Device names in a targeted spec must match the assigned backends; unknown names are an error. If unspecified, it defaults to greedy fill based on available VRAM.
+
 ## Automatic placement (`--auto-fit on|off`)
 
 `--auto-fit` requires `on` or `off` and defaults to `on` when omitted.

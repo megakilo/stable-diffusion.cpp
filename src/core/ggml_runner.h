@@ -144,6 +144,7 @@ protected:
     size_t max_graph_vram_bytes        = 0;
     bool graph_cut_layer_split_enabled = false;
     std::vector<size_t> graph_cut_layer_split_backend_vram_limits_;
+    std::vector<float> graph_cut_layer_split_ratios_;
 
     std::vector<ggml_backend_t> extra_runtime_backends;  // borrowed (SDBackendManager-owned)
     bool multi_device_eval_callback_warned = false;
@@ -343,6 +344,7 @@ public:
     void set_graph_cut_layer_split_enabled(bool enabled);
 
     void set_graph_cut_layer_split_backend_vram_limits(const std::vector<size_t>& limits);
+    void set_graph_cut_layer_split_ratios(const std::vector<float>& ratios);
 
     void set_runtime_backends(const std::vector<ggml_backend_t>& backends);
 };

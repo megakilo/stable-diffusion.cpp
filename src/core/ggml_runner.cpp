@@ -422,6 +422,7 @@ bool GGMLRunner::assign_graph_cut_layer_split_backends(ggml_cgraph* gf) {
                                              split_backends,
                                              graph_cut_layer_split_backend_vram_limits_,
                                              max_graph_vram_bytes,
+                                             graph_cut_layer_split_ratios_,
                                              graph_cut_layer_split_assignments_,
                                              canonicalize_param,
                                              &assignment)) {
@@ -643,6 +644,13 @@ void GGMLRunner::set_graph_cut_layer_split_enabled(bool enabled) {
 
 void GGMLRunner::set_graph_cut_layer_split_backend_vram_limits(const std::vector<size_t>& limits) {
     graph_cut_layer_split_backend_vram_limits_ = limits;
+    graph_cut_layer_split_assignments_.clear();
+    graph_cut_layer_split_node_assignments_.clear();
+    graph_cut_layer_split_primary_notice_logged_ = false;
+}
+
+void GGMLRunner::set_graph_cut_layer_split_ratios(const std::vector<float>& ratios) {
+    graph_cut_layer_split_ratios_ = ratios;
     graph_cut_layer_split_assignments_.clear();
     graph_cut_layer_split_node_assignments_.clear();
     graph_cut_layer_split_primary_notice_logged_ = false;
