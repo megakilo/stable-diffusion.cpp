@@ -79,6 +79,7 @@ enum scheduler_t {
     FLUX2_SCHEDULER,
     FLUX_SCHEDULER,
     BETA_SCHEDULER,
+    LLADA_IMAGE_SCHEDULER,
     SCHEDULER_COUNT
 };
 
@@ -92,6 +93,7 @@ enum prediction_t {
     FLUX_FLOW_PRED,
     SEFI_FLOW_PRED,
     MINIT2I_FLOW_PRED,
+    SENSENOVA_U1_FLOW_PRED,
     PREDICTION_COUNT
 };
 
@@ -207,6 +209,7 @@ typedef struct {
     const char* embeddings_connectors_path;
     const char* vae_path;
     const char* audio_vae_path;
+    const char* audio_encoder_path;
     const char* taesd_path;
     const char* control_net_path;
     const char* ip_adapter_path;
@@ -241,6 +244,10 @@ typedef struct {
     const char* model_args;
     bool disable_segmented_compute;  // Force monolithic graph execution even when automatic graph cutting would fit memory better
     const char* split_ratio;  // Device split ratios for multi-device modules: e.g. "cuda0:2,cuda1:1", "1:1", or per-module "diffusion=1:1,te=2:1"
+    float linear_scale;              // Override linear input scaling; 0 keeps the model default
+    float attn_scale;                // Override flash-attention K/V scaling; 0 keeps the model default
+    const char* tokenizer;           // tokenizer.json path or main=FILE,clip-l=FILE,clip-g=FILE assignments; required for PiD and Lens
+    bool sage_attn;
 } sd_ctx_params_t;
 
 typedef struct {
@@ -256,6 +263,11 @@ typedef struct {
     uint32_t channel;
     uint8_t* data;
 } sd_image_t;
+
+typedef struct {
+    // Semicolon-separated target=...,key=value rules. NULL preserves defaults.
+    const char* rules;
+} sd_image_preprocess_params_t;
 
 typedef struct {
     sd_image_t* frames;
@@ -404,6 +416,7 @@ typedef struct {
     int qwen_image_layers;
     bool circular_x;
     bool circular_y;
+    sd_image_preprocess_params_t image_preprocess;
 } sd_img_gen_params_t;
 
 typedef struct {
@@ -437,6 +450,7 @@ typedef struct {
     sd_hires_params_t hires;
     bool circular_x;
     bool circular_y;
+    sd_image_preprocess_params_t image_preprocess;
 } sd_vid_gen_params_t;
 
 typedef struct sd_ctx_t sd_ctx_t;
@@ -494,6 +508,9 @@ SD_API void free_sd_audio(sd_audio_t* audio);
 SD_API void sd_sample_params_init(sd_sample_params_t* sample_params);
 SD_API char* sd_sample_params_to_str(const sd_sample_params_t* sample_params);
 
+// Requires a loaded context; returns a static string owned by the library, or "Unknown".
+SD_API const char* sd_get_model_version_name(const sd_ctx_t* sd_ctx);
+
 SD_API enum sample_method_t sd_get_default_sample_method(const sd_ctx_t* sd_ctx);
 SD_API enum scheduler_t sd_get_default_scheduler(const sd_ctx_t* sd_ctx, enum sample_method_t sample_method);
 
@@ -516,11 +533,13 @@ enum sd_cancel_mode_t {
 SD_API void sd_cancel_generation(sd_ctx_t* sd_ctx, enum sd_cancel_mode_t mode);
 
 SD_API void sd_vid_gen_params_init(sd_vid_gen_params_t* sd_vid_gen_params);
+// If non-NULL, fps_out receives the effective encoding frame rate before preview callbacks.
 SD_API bool generate_video(sd_ctx_t* sd_ctx,
                            const sd_vid_gen_params_t* sd_vid_gen_params,
                            sd_image_t** frames_out,
                            int* num_frames_out,
-                           sd_audio_t** audio_out);
+                           sd_audio_t** audio_out,
+                           int* fps_out);
 
 typedef struct upscaler_ctx_t upscaler_ctx_t;
 

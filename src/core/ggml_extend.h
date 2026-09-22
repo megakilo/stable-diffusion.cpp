@@ -103,6 +103,18 @@ ggml_tensor* ggml_ext_pad(ggml_context* ctx,
                           bool circular_x = false,
                           bool circular_y = false);
 
+// ggml layout: x [L, IC, N], w [K, IC/groups, OC], b [OC], result [OL, OC, N].
+// force_prec_f32 keeps both input patches and weights in F32.
+ggml_tensor* ggml_ext_conv_1d(ggml_context* ctx,
+                              ggml_tensor* x,
+                              ggml_tensor* w,
+                              ggml_tensor* b,
+                              int s0              = 1,
+                              int p0              = 0,
+                              int d0              = 1,
+                              int64_t groups      = 1,
+                              bool force_prec_f32 = false);
+
 // w: [OC，IC, KH, KW]
 // x: [N, IC, IH, IW]
 // b: [OC,]
@@ -141,7 +153,8 @@ ggml_tensor* ggml_ext_conv_3d(ggml_context* ctx,
                               int d0              = 1,
                               int d1              = 1,
                               int d2              = 1,
-                              bool force_prec_f32 = false);
+                              bool force_prec_f32 = false,
+                              bool direct         = false);
 
 // w: [OC，IC, KD, 1 * 1]
 // x: [N, IC, ID, IH*IW]
@@ -207,7 +220,8 @@ ggml_tensor* ggml_ext_attention_ext(ggml_context* ctx,
                                     ggml_tensor* mask = nullptr,
                                     bool skip_reshape = false,
                                     bool flash_attn   = false,
-                                    float kv_scale    = 1.0f);
+                                    float kv_scale    = 1.0f,
+                                    bool sage_attn    = false);
 
 ggml_tensor* ggml_ext_layer_norm(ggml_context* ctx,
                                  ggml_tensor* x,
@@ -219,7 +233,8 @@ ggml_tensor* ggml_ext_group_norm(ggml_context* ctx,
                                  ggml_tensor* x,
                                  ggml_tensor* w,
                                  ggml_tensor* b,
-                                 int num_groups = 32);
+                                 int num_groups = 32,
+                                 float eps      = 1e-6f);
 
 ggml_tensor* ggml_ext_timestep_embedding(
     ggml_context* ctx,

@@ -1,6 +1,7 @@
 #include "core/ggml_extend.h"
 
 #include <cmath>
+#include <stdexcept>
 #include <utility>
 
 #include "core/ggml_extend_backend.h"
@@ -247,6 +248,7 @@ ggml_tensor* ggml_ext_linear_i8_tensorwise(ggml_context* ctx,
                                            ggml_tensor* b,
                                            int convrot_group_size,
                                            float scale) {
+#ifndef SD_USE_UPSTREAM_GGML
     GGML_ASSERT(x->type == GGML_TYPE_F32 || (x->type == GGML_TYPE_I8 && scale == 1.f));
     if (scale != 1.f) {
         x = ggml_ext_scale(ctx, x, scale);
@@ -270,6 +272,16 @@ ggml_tensor* ggml_ext_linear_i8_tensorwise(ggml_context* ctx,
         }
     }
     return x;
+#else
+    GGML_UNUSED(ctx);
+    GGML_UNUSED(x);
+    GGML_UNUSED(w);
+    GGML_UNUSED(weight_scale);
+    GGML_UNUSED(b);
+    GGML_UNUSED(convrot_group_size);
+    GGML_UNUSED(scale);
+    throw std::runtime_error("INT8 tensorwise/convrot is not supported by this ggml build");
+#endif
 }
 
 ggml_tensor* ggml_ext_pad_ext(ggml_context* ctx,
@@ -323,6 +335,76 @@ ggml_tensor* ggml_ext_pad(ggml_context* ctx,
                           bool circular_x,
                           bool circular_y) {
     return ggml_ext_pad_ext(ctx, nullptr, x, 0, p0, 0, p1, 0, p2, 0, p3, circular_x, circular_y);
+}
+
+static ggml_tensor* conv_1d(ggml_context* ctx, ggml_tensor* x, ggml_tensor* w, int s0, int p0, int d0, bool force_prec_f32) {
+    ggml_tensor* result;
+    if (force_prec_f32) {
+        ggml_tensor* patches = ggml_im2col(ctx, w, x, s0, 0, p0, 0, d0, 0, false, GGML_TYPE_F32);
+        result               = ggml_mul_mat(ctx,
+                                            ggml_reshape_2d(ctx, patches, patches->ne[0], patches->ne[2] * patches->ne[1]),
+                                            ggml_reshape_2d(ctx, w, w->ne[0] * w->ne[1], w->ne[2]));
+        result               = ggml_reshape_3d(ctx, result, patches->ne[1], w->ne[2], patches->ne[2]);
+    } else {
+        result = ggml_conv_1d(ctx, w, x, s0, p0, d0);
+    }
+    if (x->ne[2] > 1) {
+        // mul_mat packs positions and batches before output channels: [OL, N, OC].
+        result = ggml_reshape_3d(ctx, result, result->ne[0], x->ne[2], w->ne[2]);
+        result = ggml_cont(ctx, ggml_permute(ctx, result, 0, 2, 1, 3));
+    }
+    return result;
+}
+
+ggml_tensor* ggml_ext_conv_1d(ggml_context* ctx,
+                              ggml_tensor* x,
+                              ggml_tensor* w,
+                              ggml_tensor* b,
+                              int s0,
+                              int p0,
+                              int d0,
+                              int64_t groups,
+                              bool force_prec_f32) {
+    GGML_ASSERT(s0 > 0 && p0 >= 0 && d0 > 0 && groups > 0);
+    GGML_ASSERT(x->type == GGML_TYPE_F32 && x->ne[3] == 1 && w->ne[3] == 1);
+    GGML_ASSERT(x->ne[1] % groups == 0 && w->ne[2] % groups == 0);
+    GGML_ASSERT(w->ne[1] == x->ne[1] / groups);
+    GGML_ASSERT(b == nullptr || (b->type == GGML_TYPE_F32 && ggml_is_vector(b) && b->ne[0] == w->ne[2]));
+
+    // im2col requires contiguous time rows; group views must retain the real channel and batch strides.
+    if (!ggml_is_contiguous(x)) {
+        x = ggml_cont(ctx, x);
+    }
+    if (force_prec_f32 && w->type != GGML_TYPE_F32) {
+        w = ggml_cast(ctx, w, GGML_TYPE_F32);
+    }
+    if (!ggml_is_contiguous(w)) {
+        w = ggml_cont(ctx, w);
+    }
+
+    ggml_tensor* result = nullptr;
+    if (groups == 1) {
+        result = conv_1d(ctx, x, w, s0, p0, d0, force_prec_f32);
+    } else {
+        const int64_t ic_g = x->ne[1] / groups;
+        const int64_t oc_g = w->ne[2] / groups;
+        std::vector<ggml_tensor*> outputs;
+        outputs.reserve(groups);
+        for (int64_t group = 0; group < groups; ++group) {
+            ggml_tensor* x_i = ggml_view_3d(ctx, x, x->ne[0], ic_g, x->ne[2], x->nb[1], x->nb[2], group * ic_g * x->nb[1]);
+            ggml_tensor* w_i = ggml_view_3d(ctx, w, w->ne[0], ic_g, oc_g, w->nb[1], w->nb[2], group * oc_g * w->nb[2]);
+            outputs.push_back(conv_1d(ctx, x_i, w_i, s0, p0, d0, force_prec_f32));
+        }
+        result = ggml_ext_vec_concat(ctx, outputs, 1);
+    }
+    if (b != nullptr) {
+        if (!ggml_is_contiguous(b)) {
+            b = ggml_cont(ctx, b);
+        }
+        b      = ggml_reshape_3d(ctx, b, 1, w->ne[2], 1);
+        result = ggml_add_inplace(ctx, result, b);
+    }
+    return result;
 }
 
 ggml_tensor* ggml_ext_conv_2d(ggml_context* ctx,
@@ -382,8 +464,13 @@ ggml_tensor* ggml_ext_conv_3d(ggml_context* ctx,
                               int d0,
                               int d1,
                               int d2,
-                              bool force_prec_f32) {
-    if (force_prec_f32) {
+                              bool force_prec_f32,
+                              bool direct) {
+    if (direct) {
+        int64_t OC = w->ne[3] / IC;
+        int64_t N  = x->ne[3] / IC;
+        x          = ggml_conv_3d_direct(ctx, w, x, s0, s1, s2, p0, p1, p2, d0, d1, d2, (int)IC, (int)N, (int)OC);
+    } else if (force_prec_f32) {
         ggml_tensor* im2col = ggml_im2col_3d(ctx, w, x, IC, s0, s1, s2, p0, p1, p2, d0, d1, d2, w->type);
 
         int64_t OC = w->ne[3] / IC;
@@ -535,7 +622,8 @@ ggml_tensor* ggml_ext_attention_ext(ggml_context* ctx,
                                     ggml_tensor* mask,
                                     bool skip_reshape,
                                     bool flash_attn,
-                                    float kv_scale) {  // avoid overflow
+                                    float kv_scale,
+                                    bool sage_attn) {  // avoid overflow
     int64_t L_q;
     int64_t L_k;
     int64_t C;
@@ -573,6 +661,14 @@ ggml_tensor* ggml_ext_attention_ext(ggml_context* ctx,
     ggml_tensor* kqv = nullptr;
 
     auto build_kqv = [&](ggml_tensor* q_in, ggml_tensor* k_in, ggml_tensor* v_in, ggml_tensor* mask_in) -> ggml_tensor* {
+        const bool pad_head = d_head > 0 && d_head < 64 && q_in->ne[0] == d_head && k_in->ne[0] == d_head &&
+                              q_in->type == GGML_TYPE_F32 && k_in->type == GGML_TYPE_F32 &&
+                              v_in->type == GGML_TYPE_F32 && sd_backend_supports_cuda_mma(backend);
+        if (pad_head) {
+            // CUDA FA MMA starts at 64 channels; keep the original head's attention scale.
+            q_in = ggml_pad(ctx, q_in, 64 - d_head, 0, 0, 0);
+            k_in = ggml_pad(ctx, k_in, 64 - d_head, 0, 0, 0);
+        }
         if (kv_scale != 1.0f) {
             k_in = ggml_ext_scale(ctx, k_in, kv_scale);
         }
@@ -580,6 +676,9 @@ ggml_tensor* ggml_ext_attention_ext(ggml_context* ctx,
 
         v_in = ggml_ext_cont(ctx, ggml_permute(ctx, v_in, 0, 2, 1, 3));
         v_in = ggml_reshape_3d(ctx, v_in, d_head, L_k, n_kv_head * N);
+        if (pad_head) {
+            v_in = ggml_pad(ctx, v_in, 64 - d_head, 0, 0, 0);
+        }
         if (kv_scale != 1.0f) {
             v_in = ggml_ext_scale(ctx, v_in, kv_scale);
         }
@@ -609,10 +708,43 @@ ggml_tensor* ggml_ext_attention_ext(ggml_context* ctx,
         if (kv_scale != 1.0f) {
             out = ggml_ext_scale(ctx, out, 1.0f / kv_scale);
         }
+        if (pad_head) {
+            out = ggml_ext_slice(ctx, out, 0, 0, d_head);
+        }
         return out;
     };
 
-    if (flash_attn) {
+#ifndef SD_USE_UPSTREAM_GGML
+    if (sage_attn && mask == nullptr && d_head > 0 && d_head <= 128) {
+        auto q_in                 = ggml_reshape_4d(ctx, ggml_ext_cont(ctx, q->type == GGML_TYPE_F32 ? q : ggml_cast(ctx, q, GGML_TYPE_F32)), d_head, L_q, n_head, N);
+        auto k_in                 = ggml_reshape_4d(ctx, ggml_ext_cont(ctx, k->type == GGML_TYPE_F32 ? k : ggml_cast(ctx, k, GGML_TYPE_F32)), d_head, L_k, n_kv_head, N);
+        auto v_in                 = ggml_ext_cont(ctx, ggml_permute(ctx, v, 0, 2, 1, 3));
+        const int64_t padded_head = d_head <= 64 ? 64 : 128;
+        if ((padded_head != d_head || kv_scale != 1.0f) && v_in->type != GGML_TYPE_F32) {
+            v_in = ggml_cast(ctx, v_in, GGML_TYPE_F32);
+        }
+        if (padded_head != d_head) {
+            // Keep the original head's softmax scale when padding for the CUDA kernel.
+            q_in = ggml_pad(ctx, q_in, padded_head - d_head, 0, 0, 0);
+            k_in = ggml_pad(ctx, k_in, padded_head - d_head, 0, 0, 0);
+            v_in = ggml_pad(ctx, v_in, padded_head - d_head, 0, 0, 0);
+        }
+        if (kv_scale != 1.0f) {
+            k_in = ggml_ext_scale(ctx, k_in, kv_scale);
+            v_in = ggml_ext_scale(ctx, v_in, kv_scale);
+        }
+        v_in     = ggml_cast(ctx, v_in, GGML_TYPE_F16);
+        auto out = ggml_sage_attn(ctx, q_in, k_in, v_in, scale / kv_scale, GGML_SAGE_ATTN_AUTO);
+        if (ggml_backend_supports_op(backend, out)) {
+            kqv = kv_scale != 1.0f ? ggml_ext_scale(ctx, out, 1.0f / kv_scale) : out;
+            if (padded_head != d_head) {
+                kqv = ggml_ext_slice(ctx, kqv, 0, 0, d_head);
+            }
+        }
+    }
+#endif
+
+    if (kqv == nullptr && (flash_attn || sage_attn)) {
         // LOG_VERBOSE("attention_ext L_q:%d L_k:%d n_head:%d C:%d d_head:%d N:%d", L_q, L_k, n_head, C, d_head, N);
         bool can_use_flash_attn = true;
         if (mask != nullptr) {
@@ -683,17 +815,16 @@ ggml_tensor* ggml_ext_group_norm(ggml_context* ctx,
                                  ggml_tensor* x,
                                  ggml_tensor* w,
                                  ggml_tensor* b,
-                                 int num_groups) {
+                                 int num_groups,
+                                 float eps) {
     if (ggml_n_dims(x) >= 3 && w != nullptr && b != nullptr) {
         w = ggml_reshape_4d(ctx, w, 1, 1, w->ne[0], 1);
         b = ggml_reshape_4d(ctx, b, 1, 1, b->ne[0], 1);
     }
 
-    const float eps = 1e-6f;  // default eps parameter
-    x               = ggml_group_norm(ctx, x, num_groups, eps);
+    x = ggml_group_norm(ctx, x, num_groups, eps);
     if (w != nullptr && b != nullptr) {
         x = ggml_mul_inplace(ctx, x, w);
-        // b = ggml_repeat(ctx, b, x);
         x = ggml_add_inplace(ctx, x, b);
     }
     return x;

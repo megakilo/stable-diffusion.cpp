@@ -65,7 +65,7 @@ namespace sd::pipeline {
             return LCM_SCHEDULER;
         } else if (sample_method == DDIM_TRAILING_SAMPLE_METHOD) {
             return SIMPLE_SCHEDULER;
-        } else if (sd != nullptr && sd_version_is_flux(sd->version)) {
+        } else if (sd != nullptr && (sd_version_is_flux(sd->version) || sd->version == VERSION_QWEN_IMAGE_2_1)) {
             return FLUX_SCHEDULER;
         } else if (sd != nullptr && sd_version_is_flux2(sd->version)) {
             return FLUX2_SCHEDULER;
@@ -73,6 +73,8 @@ namespace sd::pipeline {
             return LTX2_SCHEDULER;
         } else if (sd != nullptr && sd_version_is_ideogram4(sd->version)) {
             return LOGIT_NORMAL_SCHEDULER;
+        } else if (sd != nullptr && sd_version_is_llada_image(sd->version)) {
+            return LLADA_IMAGE_SCHEDULER;
         }
         return DISCRETE_SCHEDULER;
     }
@@ -161,7 +163,10 @@ namespace sd::pipeline {
         frames           = sd->align_video_frames(requested_frames);
         clip_skip        = sd_vid_gen_params->clip_skip;
         fps              = std::max(1, sd_vid_gen_params->fps);
-        if (sd_version_is_minimax_h3(sd->version) && fps != 24) {
+        if (sd->version == VERSION_WAN2_2_S2V && sd_vid_gen_params->fps != 16) {
+            LOG_WARN("Wan2.2 S2V uses 16 fps; overriding requested fps %d", sd_vid_gen_params->fps);
+            fps = 16;
+        } else if (sd_version_is_minimax_h3(sd->version) && fps != 24) {
             LOG_WARN("MiniMax-H3 uses 24 fps; overriding requested fps %d", fps);
             fps = 24;
         }

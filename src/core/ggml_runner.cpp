@@ -1,7 +1,9 @@
 #include <algorithm>
+#include <exception>
 #include <map>
 #include <utility>
 
+#include "core/ggml_extend.h"
 #include "core/ggml_extend_backend.h"
 #include "core/ggml_runner.h"
 #include "core/ggml_tensor_utils.h"
@@ -10,6 +12,21 @@
 #include "core/segment_weight_pipeline.h"
 
 using namespace sd;
+
+ggml_tensor* ggml_ext_attention_ext(GGMLRunnerContext* ctx,
+                                    ggml_tensor* q,
+                                    ggml_tensor* k,
+                                    ggml_tensor* v,
+                                    int64_t n_head,
+                                    ggml_tensor* mask,
+                                    bool skip_reshape,
+                                    bool flash_attn,
+                                    float kv_scale) {
+    if (ctx->attn_scale > 0.f) {
+        kv_scale = ctx->attn_scale;
+    }
+    return ggml_ext_attention_ext(ctx->ggml_ctx, ctx->backend, q, k, v, n_head, mask, skip_reshape, flash_attn, kv_scale, ctx->sage_attn_enabled);
+}
 
 void GGMLRunner::alloc_params_ctx() {
     ggml_init_params params;
@@ -325,21 +342,17 @@ void GGMLRunner::copy_data_to_backend_tensor(ggml_cgraph* gf, bool clear_after_c
     }
 }
 
-bool GGMLRunner::resolve_graph_cut_plan(ggml_cgraph* gf,
-                                        GraphCutPlan* plan_out) {
-    GGML_ASSERT(plan_out != nullptr);
+const GGMLRunner::GraphCutPlan& GGMLRunner::resolve_graph_cut_plan(ggml_cgraph* gf) {
     GGML_ASSERT(gf != nullptr);
-    *plan_out = sd::ggml_graph_cut::resolve_plan(runtime_backend,
-                                                 gf,
-                                                 &graph_cut_plan_cache_,
-                                                 params_tensor_set_,
-                                                 get_desc().c_str());
-    return true;
+    return sd::ggml_graph_cut::resolve_plan(runtime_backend,
+                                            gf,
+                                            &graph_cut_plan_cache_,
+                                            params_tensor_set_,
+                                            get_desc().c_str());
 }
 
-bool GGMLRunner::resolve_graph_cut_layer_split_plan(ggml_cgraph* gf,
-                                                    GraphCutPlan* plan_out) {
-    return resolve_graph_cut_plan(gf, plan_out);
+const GGMLRunner::GraphCutPlan& GGMLRunner::resolve_graph_cut_layer_split_plan(ggml_cgraph* gf) {
+    return resolve_graph_cut_plan(gf);
 }
 
 bool GGMLRunner::assign_graph_cut_layer_split_backends(ggml_cgraph* gf) {
@@ -352,10 +365,7 @@ bool GGMLRunner::assign_graph_cut_layer_split_backends(ggml_cgraph* gf) {
         return false;
     }
 
-    GraphCutPlan plan;
-    if (!resolve_graph_cut_layer_split_plan(gf, &plan)) {
-        return false;
-    }
+    const auto& plan = resolve_graph_cut_layer_split_plan(gf);
     if (!plan.valid || !plan.has_cuts || plan.segments.size() <= 1) {
         auto manager = residency_manager.lock();
         if (manager == nullptr) {
@@ -511,7 +521,11 @@ GGMLRunnerContext GGMLRunner::get_context() {
     runner_ctx.ggml_ctx              = compute_ctx;
     runner_ctx.backend               = runtime_backend;
     runner_ctx.flash_attn_enabled    = flash_attn_enabled;
+    runner_ctx.sage_attn_enabled     = sage_attn_enabled;
+    runner_ctx.linear_scale          = linear_scale;
+    runner_ctx.attn_scale            = attn_scale;
     runner_ctx.conv2d_direct_enabled = conv2d_direct_enabled;
+    runner_ctx.conv3d_direct_enabled = conv3d_direct_enabled;
     runner_ctx.circular_x_enabled    = circular_x_enabled;
     runner_ctx.circular_y_enabled    = circular_y_enabled;
     runner_ctx.weight_adapter        = weight_adapter;
@@ -577,6 +591,7 @@ std::optional<sd::Tensor<float>> GGMLRunner::compute(get_graph_cb_t get_graph,
                                                      bool auto_runner_end,
                                                      bool no_return,
                                                      const std::function<bool()>& read_outputs) {
+    last_compute_status_ = GGML_STATUS_FAILED;
     if (graph_active_) {
         LOG_ERROR("%s does not support reentrant graph execution", get_desc().c_str());
         return std::nullopt;
@@ -600,7 +615,9 @@ std::optional<sd::Tensor<float>> GGMLRunner::compute(get_graph_cb_t get_graph,
         GGMLRunner& runner;
         const bool& success;
         ~GraphEndGuard() {
-            runner.workspace_.segment_end();
+            if (!runner.workspace_.segment_end()) {
+                runner.last_compute_status_ = GGML_STATUS_FAILED;
+            }
             runner.cache_.graph_end(false);
             runner.cut_cache_.clear();
             runner.free_compute_ctx();
@@ -625,10 +642,19 @@ std::optional<sd::Tensor<float>> GGMLRunner::compute(get_graph_cb_t get_graph,
                 params_tensor_set_.insert(parameter);
         }
     }
-    auto output = execute_graph(graph, n_threads, no_return, read_outputs);
-    success     = output.has_value();
+    std::optional<sd::Tensor<float>> output;
+    try {
+        output = execute_graph(graph, n_threads, no_return, read_outputs);
+    } catch (const std::exception& error) {
+        last_compute_status_ = GGML_STATUS_FAILED;
+        LOG_ERROR("%s graph execution failed on %s: %s", get_desc().c_str(),
+                  ggml_backend_name(runtime_backend), error.what());
+        return std::nullopt;
+    }
+    success = output.has_value();
     if (success) {
         cache_.graph_end(true);
+        last_compute_status_ = GGML_STATUS_SUCCESS;
     }
     return output;
 }
@@ -753,6 +779,7 @@ bool GGMLRunner::execute_segment(ggml_cgraph* graph, int n_threads) {
     }
     workspace_.synchronize();
     if (status != GGML_STATUS_SUCCESS) {
+        last_compute_status_ = status;
         LOG_ERROR("%s compute failed: %s", get_desc().c_str(), ggml_status_to_string(status));
         return false;
     }
@@ -801,24 +828,26 @@ std::optional<Tensor<float>> GGMLRunner::execute_graph(ggml_cgraph* graph, int n
     if (!assign_graph_cut_layer_split_backends(graph)) {
         return std::nullopt;
     }
-    const auto params = collect_used_param_tensors(graph);
-    ggml_graph_cut::Plan plan;
-    if (!resolve_graph_cut_plan(graph, &plan)) {
-        return std::nullopt;
-    }
-    const auto full_measurement = measure(graph, plan.compute_buffer_size);
+    const auto params           = collect_used_param_tensors(graph);
+    const auto& cached_plan     = resolve_graph_cut_plan(graph);
+    const auto full_measurement = measure(graph, cached_plan.compute_buffer_size);
     if (full_measurement.buffers.empty()) {
+        last_compute_status_ = GGML_STATUS_ALLOC_FAILED;
         return std::nullopt;
     }
     auto manager         = residency_manager.lock();
     const bool segmented = !is_multi_device() && !sd_backend_is_cpu(runtime_backend) &&
                            manager != nullptr && manager->segmented_compute_enabled() &&
-                           plan.valid && plan.has_cuts && plan.segments.size() > 1 &&
+                           cached_plan.valid && cached_plan.has_cuts && cached_plan.segments.size() > 1 &&
                            !fits(memory_requests(full_measurement.buffers, cache_.pending_bytes(graph)), params);
+    ggml_graph_cut::Plan monolithic_plan;
     if (!segmented) {
-        ggml_graph_cut::Segment segment;
+        monolithic_plan.segments.emplace_back();
+        auto& segment               = monolithic_plan.segments.back();
         segment.group_name          = "graph";
-        segment.compute_buffer_size = plan.compute_buffer_size;
+        segment.compute_buffer_size = cached_plan.compute_buffer_size;
+        segment.internal_node_indices.reserve(ggml_graph_n_nodes(graph));
+        segment.input_refs.reserve(ggml_graph_cut::leaf_count(graph));
         for (int i = 0; i < ggml_graph_n_nodes(graph); ++i) {
             segment.internal_node_indices.push_back(i);
         }
@@ -831,8 +860,8 @@ std::optional<Tensor<float>> GGMLRunner::execute_graph(ggml_cgraph* graph, int n
                                    : ggml_graph_cut::Segment::INPUT_EXTERNAL;
             segment.input_refs.push_back(input);
         }
-        plan.segments = {std::move(segment)};
     }
+    const auto& plan            = segmented ? cached_plan : monolithic_plan;
     const bool segments_changed = plan.segments.size() != logged_segment_count_;
     if (segments_changed && (segmented || logged_segment_count_ > 1)) {
         LOG_VERBOSE("%s using %zu segment%s", get_desc().c_str(),
@@ -874,7 +903,9 @@ std::optional<Tensor<float>> GGMLRunner::execute_graph(ggml_cgraph* graph, int n
             SegmentGraphBindings& bindings;
             ggml_context* context;
             ~SegmentCleanup() {
-                runner.workspace_.segment_end();
+                if (!runner.workspace_.segment_end()) {
+                    runner.last_compute_status_ = GGML_STATUS_FAILED;
+                }
                 bindings.restore();
                 weights.segment_end();
                 ggml_free(context);
@@ -884,6 +915,7 @@ std::optional<Tensor<float>> GGMLRunner::execute_graph(ggml_cgraph* graph, int n
 
         auto measurement = segmented ? measure(segment_graph, segment.compute_buffer_size) : full_measurement;
         if (!workspace_.prepare(measurement)) {
+            last_compute_status_ = GGML_STATUS_ALLOC_FAILED;
             return fail_segment("workspace preparation");
         }
         const size_t cut_bytes       = last ? 0 : cut_cache_.estimate_output_bytes(graph, segment);
@@ -891,11 +923,18 @@ std::optional<Tensor<float>> GGMLRunner::execute_graph(ggml_cgraph* graph, int n
         auto ensure_capacity         = [&]() {
             sync_runtime_residency();
             auto requests = memory_requests(measurement.buffers, new_cache_bytes);
-            if (!fits(requests, weights.params(index)) && workspace_.release_excess(measurement)) {
+            if (fits(requests, weights.params(index))) {
+                return true;
+            }
+            if (workspace_.release_excess(measurement)) {
                 sync_runtime_residency();
                 requests = memory_requests(measurement.buffers, new_cache_bytes);
             }
-            return weights.ensure_segment_capacity(index, requests);
+            const bool ready = weights.ensure_segment_capacity(index, requests);
+            if (!ready && manager != nullptr) {
+                last_compute_status_ = GGML_STATUS_ALLOC_FAILED;
+            }
+            return ready;
         };
         if (!weights.segment_start(index, ensure_capacity)) {
             return fail_segment("weight preparation");
@@ -904,12 +943,17 @@ std::optional<Tensor<float>> GGMLRunner::execute_graph(ggml_cgraph* graph, int n
         if (!workspace_.measurement_matches(segment_graph, measurement)) {
             measurement = measure(segment_graph, segment.compute_buffer_size);
         }
-        if (!workspace_.prepare(measurement) || !ensure_capacity()) {
+        if (!workspace_.prepare(measurement)) {
+            last_compute_status_ = GGML_STATUS_ALLOC_FAILED;
+            return fail_segment("workspace preparation");
+        }
+        if (!ensure_capacity()) {
             return fail_segment("workspace capacity check");
         }
         if (!workspace_.allocate(segment_graph, [&](ggml_backend_sched_t scheduler, ggml_cgraph* current) {
                 pin_multi_device_nodes(scheduler, current);
             })) {
+            last_compute_status_ = GGML_STATUS_ALLOC_FAILED;
             return fail_segment("workspace allocation");
         }
         for (const auto& size : measurement.buffers) {
@@ -945,6 +989,10 @@ std::optional<Tensor<float>> GGMLRunner::execute_graph(ggml_cgraph* graph, int n
                     return fail_segment("output readback");
                 }
             }
+        }
+        if (!workspace_.segment_end()) {
+            last_compute_status_ = GGML_STATUS_FAILED;
+            return fail_segment("workspace synchronization");
         }
         // Final outputs and their callbacks may still be views of consumed cuts.
         cut_cache_.prune(segment.future_cut_names);

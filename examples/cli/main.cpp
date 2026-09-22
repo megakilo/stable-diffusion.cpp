@@ -41,7 +41,6 @@ struct SDCliParams {
     std::string metadata_format = "text";
 
     sd_log_level_t log_level = SD_LOG_INFO;
-    bool canny_preprocess    = false;
     bool convert_name        = false;
 
     preview_t preview_method = PREVIEW_NONE;
@@ -107,10 +106,6 @@ struct SDCliParams {
         };
 
         options.bool_options = {
-            {"",
-             "--canny",
-             "apply canny preprocessor (edge detection)",
-             true, &canny_preprocess},
             {"",
              "--convert-name",
              "convert tensor name (for convert mode)",
@@ -268,7 +263,6 @@ struct SDCliParams {
             << "  metadata_format: \"" << metadata_format << "\",\n"
             << "  log_level: " << log_level_name(log_level) << ",\n"
             << "  color: " << (color ? "true" : "false") << ",\n"
-            << "  canny_preprocess: " << (canny_preprocess ? "true" : "false") << ",\n"
             << "  convert_name: " << (convert_name ? "true" : "false") << ",\n"
             << "  preview_method: " << previews_str[preview_method] << ",\n"
             << "  preview_interval: " << preview_interval << ",\n"
@@ -328,9 +322,7 @@ void sd_log_cb(enum sd_log_level_t level, const char* log, void* data) {
 
 bool load_images_from_dir(const std::string dir,
                           std::vector<SDImageOwner>& images,
-                          int expected_width  = 0,
-                          int expected_height = 0,
-                          int max_image_num   = 0) {
+                          int max_image_num = 0) {
     if (!fs::exists(dir) || !fs::is_directory(dir)) {
         LOG_ERROR("'%s' is not a valid directory\n", dir.c_str());
         return false;
@@ -357,7 +349,8 @@ bool load_images_from_dir(const std::string dir,
             LOG_VERBOSE("load image %zu from '%s'", images.size(), path.c_str());
             int width             = 0;
             int height            = 0;
-            uint8_t* image_buffer = load_image_from_file(path.c_str(), width, height, expected_width, expected_height);
+            int loaded_channel    = 0;
+            uint8_t* image_buffer = load_image_from_file(path.c_str(), width, height, loaded_channel, 0, 0);
             if (image_buffer == nullptr) {
                 LOG_ERROR("load image from '%s' failed", path.c_str());
                 return false;
@@ -365,7 +358,7 @@ bool load_images_from_dir(const std::string dir,
 
             images.emplace_back(sd_image_t{(uint32_t)width,
                                            (uint32_t)height,
-                                           3,
+                                           (uint32_t)loaded_channel,
                                            image_buffer});
 
             if (max_image_num > 0 && static_cast<int>(images.size()) >= max_image_num) {
@@ -419,7 +412,8 @@ void step_callback(int step, int frame_count, sd_image_t* image, bool is_noisy, 
             LOG_ERROR("save preview image to '%s' failed", path.string().c_str());
         }
     } else {
-        if (create_video_from_sd_images(cli_params->preview_path.c_str(), image, frame_count, cli_params->preview_fps, cli_params->compression_quality) != 0) {
+        int fps = cli_params->preview_method == PREVIEW_PROJ ? cli_params->preview_fps / 4 : cli_params->preview_fps;
+        if (create_video_from_sd_images(cli_params->preview_path.c_str(), image, frame_count, fps, cli_params->compression_quality) != 0) {
             LOG_ERROR("save preview video to '%s' failed", cli_params->preview_path.c_str());
         }
     }
@@ -540,12 +534,16 @@ bool save_results(const SDCliParams& cli_params,
     if (cli_params.mode == VID_GEN && num_results > 1) {
         if (ext_lower != ".avi" && ext_lower != ".webp" && ext_lower != ".webm")
             ext = ".avi";
+        std::string params = gen_params.embed_image_metadata
+                                 ? get_image_params(ctx_params, gen_params, gen_params.seed, cli_params.mode)
+                                 : "";
+
         fs::path video_path = base_path;
         video_path += ext;
         std::string final_ext_lower = ext.string();
         std::transform(final_ext_lower.begin(), final_ext_lower.end(), final_ext_lower.begin(), ::tolower);
         const bool mux_audio = generated_audio != nullptr && (final_ext_lower == ".avi" || final_ext_lower == ".webm");
-        if (create_video_from_sd_images(video_path.string().c_str(), results, num_results, gen_params.fps, cli_params.compression_quality, mux_audio ? generated_audio : nullptr) == 0) {
+        if (create_video_from_sd_images(video_path.string().c_str(), results, num_results, gen_params.fps, cli_params.compression_quality, mux_audio ? generated_audio : nullptr, params) == 0) {
             LOG_INFO("save result video to '%s'", video_path.string().c_str());
             if (generated_audio != nullptr && !mux_audio) {
                 fs::path wav_path = video_path;
@@ -648,8 +646,8 @@ int main(int argc, const char* argv[]) {
     SDContextParams ctx_params;
     SDGenerationParams gen_params;
 
-    parse_args(argc, argv, cli_params, ctx_params, gen_params);
     sd_set_log_callback(sd_log_cb, (void*)&cli_params);
+    parse_args(argc, argv, cli_params, ctx_params, gen_params);
 
     if (cli_params.mode == METADATA) {
         MetadataReadOptions options;
@@ -687,8 +685,6 @@ int main(int argc, const char* argv[]) {
         }
     }
     cli_params.preview_fps = gen_params.fps;
-    if (cli_params.preview_method == PREVIEW_PROJ)
-        cli_params.preview_fps /= 4;
 
     sd_set_preview_callback(step_callback,
                             cli_params.preview_method,
@@ -747,16 +743,8 @@ int main(int argc, const char* argv[]) {
 
     auto load_image_and_update_size = [&](const std::string& path,
                                           SDImageOwner& image,
-                                          bool resize_image    = true,
                                           int expected_channel = 3) -> bool {
-        int expected_width  = 0;
-        int expected_height = 0;
-        if (resize_image && gen_params.width_and_height_are_set()) {
-            expected_width  = gen_params.width;
-            expected_height = gen_params.height;
-        }
-
-        if (!load_sd_image_from_file(image.put(), path.c_str(), expected_width, expected_height, expected_channel)) {
+        if (!load_sd_image_from_file(image.put(), path.c_str(), 0, 0, expected_channel)) {
             LOG_ERROR("load image from '%s' failed", path.c_str());
             return false;
         }
@@ -778,7 +766,8 @@ int main(int argc, const char* argv[]) {
     };
 
     if (gen_params.init_image_path.size() > 0) {
-        if (!load_image_and_update_size(gen_params.init_image_path, gen_params.init_image)) {
+        const bool native_init = cli_params.mode == IMG_GEN || cli_params.mode == ADETAILER;
+        if (!load_image_and_update_size(gen_params.init_image_path, gen_params.init_image, native_init ? 0 : 3)) {
             return 1;
         }
     }
@@ -792,8 +781,8 @@ int main(int argc, const char* argv[]) {
     if (gen_params.ref_image_paths.size() > 0) {
         gen_params.ref_images.clear();
         for (auto& path : gen_params.ref_image_paths) {
-            SDImageOwner ref_image({0, 0, 3, nullptr});
-            if (!load_image_and_update_size(path, ref_image, false)) {
+            SDImageOwner ref_image({0, 0, 0, nullptr});
+            if (!load_image_and_update_size(path, ref_image, 0)) {
                 return 1;
             }
             gen_params.ref_images.push_back(std::move(ref_image));
@@ -834,40 +823,21 @@ int main(int argc, const char* argv[]) {
     if (gen_params.mask_image_path.size() > 0) {
         if (!load_sd_image_from_file(gen_params.mask_image.put(),
                                      gen_params.mask_image_path.c_str(),
-                                     gen_params.get_resolved_width(),
-                                     gen_params.get_resolved_height(),
+                                     0,
+                                     0,
                                      1)) {
             LOG_ERROR("load image from '%s' failed", gen_params.mask_image_path.c_str());
             return 1;
         }
-    } else {
-        sd_image_t generated_mask = {0, 0, 1, nullptr};
-        generated_mask.data       = (uint8_t*)malloc(gen_params.get_resolved_width() * gen_params.get_resolved_height());
-        if (generated_mask.data == nullptr) {
-            LOG_ERROR("malloc mask image failed");
-            return 1;
-        }
-        generated_mask.width  = gen_params.get_resolved_width();
-        generated_mask.height = gen_params.get_resolved_height();
-        memset(generated_mask.data, 255, gen_params.get_resolved_width() * gen_params.get_resolved_height());
-        gen_params.mask_image.reset(generated_mask);
     }
 
     if (gen_params.control_image_path.size() > 0) {
         if (!load_sd_image_from_file(gen_params.control_image.put(),
                                      gen_params.control_image_path.c_str(),
-                                     gen_params.get_resolved_width(),
-                                     gen_params.get_resolved_height())) {
+                                     0,
+                                     0)) {
             LOG_ERROR("load image from '%s' failed", gen_params.control_image_path.c_str());
             return 1;
-        }
-        if (cli_params.canny_preprocess) {  // apply preprocessor
-            preprocess_canny(gen_params.control_image.get(),
-                             0.08f,
-                             0.08f,
-                             0.8f,
-                             1.0f,
-                             false);
         }
     }
 
@@ -885,8 +855,6 @@ int main(int argc, const char* argv[]) {
         gen_params.control_frames.clear();
         if (!load_images_from_dir(gen_params.control_video_path,
                                   gen_params.control_frames,
-                                  gen_params.get_resolved_width(),
-                                  gen_params.get_resolved_height(),
                                   gen_params.video_frames)) {
             return 1;
         }
@@ -895,10 +863,7 @@ int main(int argc, const char* argv[]) {
     if (!gen_params.pm_id_images_dir.empty()) {
         gen_params.pm_id_images.clear();
         if (!load_images_from_dir(gen_params.pm_id_images_dir,
-                                  gen_params.pm_id_images,
-                                  0,
-                                  0,
-                                  0)) {
+                                  gen_params.pm_id_images)) {
             return 1;
         }
     }
@@ -951,9 +916,10 @@ int main(int argc, const char* argv[]) {
         } else if (cli_params.mode == VID_GEN) {
             sd_vid_gen_params_t vid_gen_params = gen_params.to_sd_vid_gen_params_t();
             sd_image_t* generated_video        = nullptr;
-            if (!generate_video(sd_ctx.get(), &vid_gen_params, &generated_video, &num_results, &generated_audio)) {
+            if (!generate_video(sd_ctx.get(), &vid_gen_params, &generated_video, &num_results, &generated_audio, &cli_params.preview_fps)) {
                 generated_video = nullptr;
             }
+            gen_params.fps = cli_params.preview_fps;
             results.adopt(generated_video, num_results);
         }
 

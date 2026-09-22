@@ -206,7 +206,9 @@ public:
 
     ggml_tensor* forward(GGMLRunnerContext* ctx, ggml_tensor* x) override {
         ggml_tensor* w            = params["weight"];
+        const float scale         = ctx->linear_scale > 0.f ? ctx->linear_scale : this->scale;
         ggml_tensor* weight_scale = has_weight_scale ? params["weight_scale"] : nullptr;
+#ifndef SD_USE_UPSTREAM_GGML
         if (w->type == GGML_TYPE_F8_E4M3 || w->type == GGML_TYPE_F8_E5M2) {
             bool supports_fp8_matmul = false;
             if (ctx->backend != nullptr) {
@@ -220,6 +222,7 @@ public:
                 w = ggml_cast(ctx->ggml_ctx, w, GGML_TYPE_BF16);
             }
         }
+#endif
         ggml_tensor* b = nullptr;
         if (bias) {
             b = params["bias"];
@@ -237,6 +240,7 @@ public:
             if (ctx->weight_adapter && b != nullptr) {
                 b = ctx->weight_adapter->patch_weight(ctx->ggml_ctx, ctx->backend, b, prefix + "bias");
             }
+#ifndef SD_USE_UPSTREAM_GGML
             if (int8_convrot && scale == 1.f) {
                 const auto cache_key = std::make_pair(x, int8_convrot_group_size);
                 auto cached          = ctx->int8_convrot_cache.find(cache_key);
@@ -247,6 +251,7 @@ public:
                     x = cached->second;
                 }
             }
+#endif
             out = ggml_ext_linear_i8_tensorwise(ctx->ggml_ctx,
                                                 x,
                                                 w,
@@ -309,6 +314,7 @@ public:
 __STATIC_INLINE__ bool support_get_rows(ggml_type wtype) {
     switch (wtype) {
         case GGML_TYPE_F16:
+        case GGML_TYPE_BF16:
         case GGML_TYPE_Q8_0:
         case GGML_TYPE_Q5_1:
         case GGML_TYPE_Q5_0:
@@ -363,6 +369,61 @@ public:
 
         // [N, n_token, embedding_dim]
         return embedding;
+    }
+};
+
+class Conv1d : public UnaryBlock {
+protected:
+    int64_t in_channels;
+    int64_t out_channels;
+    int64_t groups;
+    int kernel_size;
+    int stride;
+    int padding;
+    int dilation;
+    bool bias;
+    bool force_prec_f32;
+
+    void init_params(ggml_context* ctx, const String2TensorStorage& tensor_storage_map = {}, const std::string prefix = "") override {
+        ggml_type wtype  = get_type(prefix + "weight", tensor_storage_map, GGML_TYPE_F16);
+        params["weight"] = ggml_new_tensor_3d(ctx, wtype, kernel_size, in_channels / groups, out_channels);
+        if (bias) {
+            params["bias"] = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, out_channels);
+        }
+    }
+
+public:
+    Conv1d(int64_t in_channels,
+           int64_t out_channels,
+           int kernel_size,
+           int stride          = 1,
+           int padding         = 0,
+           int dilation        = 1,
+           int64_t groups      = 1,
+           bool bias           = true,
+           bool force_prec_f32 = false)
+        : in_channels(in_channels),
+          out_channels(out_channels),
+          groups(groups),
+          kernel_size(kernel_size),
+          stride(stride),
+          padding(padding),
+          dilation(dilation),
+          bias(bias),
+          force_prec_f32(force_prec_f32) {
+        GGML_ASSERT(in_channels > 0 && out_channels > 0 && groups > 0);
+        GGML_ASSERT(in_channels % groups == 0 && out_channels % groups == 0);
+        GGML_ASSERT(kernel_size > 0 && stride > 0 && padding >= 0 && dilation > 0);
+    }
+
+    std::string get_desc() override {
+        return "Conv1d";
+    }
+
+    ggml_tensor* forward(GGMLRunnerContext* ctx, ggml_tensor* x) override {
+        GGML_ASSERT(x->ne[1] == in_channels);
+        return ggml_ext_conv_1d(ctx->ggml_ctx, x, params["weight"], bias ? params["bias"] : nullptr,
+                                stride, padding, dilation, groups, force_prec_f32);
     }
 };
 
@@ -671,7 +732,7 @@ public:
                                 std::get<2>(stride), std::get<1>(stride), std::get<0>(stride),
                                 std::get<2>(padding), std::get<1>(padding), std::get<0>(padding),
                                 std::get<2>(dilation), std::get<1>(dilation), std::get<0>(dilation),
-                                force_prec_f32);
+                                force_prec_f32, ctx->conv3d_direct_enabled);
     }
 };
 
@@ -764,7 +825,7 @@ public:
                 b = ctx->weight_adapter->patch_weight(ctx->ggml_ctx, ctx->backend, b, prefix + "bias");
             }
         }
-        return ggml_ext_group_norm(ctx->ggml_ctx, x, w, b, num_groups);
+        return ggml_ext_group_norm(ctx->ggml_ctx, x, w, b, num_groups, eps);
     }
 };
 
@@ -778,21 +839,30 @@ class RMSNorm : public UnaryBlock {
 protected:
     int64_t hidden_size;
     float eps;
+    bool elementwise_affine;
     std::string prefix;
 
     void init_params(ggml_context* ctx, const String2TensorStorage& tensor_storage_map = {}, std::string prefix = "") override {
-        this->prefix         = prefix;
+        this->prefix = prefix;
+        if (!elementwise_affine) {
+            return;
+        }
         enum ggml_type wtype = GGML_TYPE_F32;
         params["weight"]     = ggml_new_tensor_1d(ctx, wtype, hidden_size);
     }
 
 public:
     RMSNorm(int64_t hidden_size,
-            float eps = 1e-06f)
+            float eps               = 1e-06f,
+            bool elementwise_affine = true)
         : hidden_size(hidden_size),
-          eps(eps) {}
+          eps(eps),
+          elementwise_affine(elementwise_affine) {}
 
     ggml_tensor* forward(GGMLRunnerContext* ctx, ggml_tensor* x) override {
+        if (!elementwise_affine) {
+            return ggml_rms_norm(ctx->ggml_ctx, x, eps);
+        }
         ggml_tensor* w = params["weight"];
         if (ctx->weight_adapter) {
             w = ctx->weight_adapter->patch_weight(ctx->ggml_ctx, ctx->backend, w, prefix + "weight");
@@ -869,7 +939,7 @@ public:
             v = v_proj->forward(ctx, x);
         }
 
-        x = ggml_ext_attention_ext(ctx->ggml_ctx, ctx->backend, q, k, v, n_head, mask, false);  // [N, n_token, embed_dim]
+        x = ggml_ext_attention_ext(ctx, q, k, v, n_head, mask, false);  // [N, n_token, embed_dim]
 
         x = out_proj->forward(ctx, x);  // [N, n_token, embed_dim]
         return x;

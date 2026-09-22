@@ -274,6 +274,7 @@ bool ModelManager::register_param_tensors(ModelComponent component,
         new_states.push_back(std::move(state));
     }
 
+    resolved_tensor_states_.clear();
     for (auto& state : new_states) {
         TensorState* registered_state                      = state.get();
         tensor_states_by_tensor_[registered_state->tensor] = registered_state;
@@ -369,6 +370,7 @@ bool ModelManager::unregister_tensor_states(const std::unordered_set<TensorState
         }
     }
 
+    resolved_tensor_states_.clear();
     for (auto it = tensor_states_by_tensor_.begin(); it != tensor_states_by_tensor_.end();) {
         if (target_states.count(it->second) > 0) {
             it = tensor_states_by_tensor_.erase(it);
@@ -1199,22 +1201,52 @@ bool ModelManager::resolve_required_tensor_states(const std::vector<ggml_tensor*
                                                   std::vector<TensorState*>& required_states,
                                                   ggml_backend_t compute_backend) const {
     required_states.clear();
+    required_states.reserve(tensors.size());
+    auto append_states = [&](const std::vector<TensorState*>& states) {
+        for (TensorState* state : states) {
+            if (compute_backend == nullptr || state->compute_backend == nullptr ||
+                state->compute_backend == compute_backend) {
+                required_states.push_back(state);
+            }
+        }
+    };
+    for (auto it = resolved_tensor_states_.begin(); it != resolved_tensor_states_.end(); ++it) {
+        if (it->tensors == tensors) {
+            append_states(it->states);
+            resolved_tensor_states_.splice(resolved_tensor_states_.begin(), resolved_tensor_states_, it);
+            return true;
+        }
+    }
+    std::vector<TensorState*> states;
+    states.reserve(tensors.size());
     std::unordered_set<TensorState*> seen;
+    seen.reserve(tensors.size());
+    bool cacheable = true;
     for (ggml_tensor* tensor : tensors) {
         if (tensor == nullptr) {
             continue;
         }
-        auto param = resolve_param_tensor(tensor);
-        auto found = tensor_states_by_tensor_.find(param);
+        auto found = tensor_states_by_tensor_.find(tensor);
+        // Unregistered views can be rebound without changing the parameter list.
+        cacheable &= found != tensor_states_by_tensor_.end();
+        for (auto view = tensor->view_src; found == tensor_states_by_tensor_.end() && view != nullptr; view = view->view_src) {
+            found = tensor_states_by_tensor_.find(view);
+        }
         if (found == tensor_states_by_tensor_.end()) {
             LOG_ERROR("model manager tensor '%s' is not registered", ggml_get_name(tensor));
             return false;
         }
         TensorState* state = found->second;
-        if ((compute_backend == nullptr || state->compute_backend == nullptr ||
-             state->compute_backend == compute_backend) &&
-            seen.insert(state).second) {
-            required_states.push_back(state);
+        if (seen.insert(state).second) {
+            states.push_back(state);
+        }
+    }
+    append_states(states);
+    if (cacheable && !tensors.empty()) {
+        static constexpr size_t MAX_RESOLVED_LISTS = 4;
+        resolved_tensor_states_.push_front({tensors, std::move(states)});
+        if (resolved_tensor_states_.size() > MAX_RESOLVED_LISTS) {
+            resolved_tensor_states_.pop_back();
         }
     }
     return true;
@@ -1274,8 +1306,7 @@ size_t ModelManager::compute_backend_alloc_size(const std::vector<TensorState*>&
     size_t total_size = 0;
     std::unordered_set<TensorState*> seen;
     for (TensorState* state : states) {
-        if (state == nullptr || state->tensor == nullptr || !seen.insert(state).second ||
-            should_ignore(*state) || is_optional_missing_tensor(state->name)) {
+        if (state == nullptr || state->tensor == nullptr) {
             continue;
         }
         const bool compute_resident =
@@ -1283,6 +1314,9 @@ size_t ModelManager::compute_backend_alloc_size(const std::vector<TensorState*>&
                 ? state->loaded_to_params_backend
                 : state->staged_to_compute_backend;
         if (missing_only && compute_resident) {
+            continue;
+        }
+        if (!seen.insert(state).second || should_ignore(*state) || is_optional_missing_tensor(state->name)) {
             continue;
         }
 
@@ -1579,23 +1613,48 @@ void ModelManager::remove_runtime_owner(uintptr_t owner_id) {
 
 ModelManager::CapacityCheck ModelManager::check_capacity(
     const DeviceMemoryRequest& request,
-    const std::vector<TensorState*>& states) const {
+    const std::vector<TensorState*>& states,
+    bool log_details) const {
     CapacityCheck result;
     if (request.compute_backend == nullptr || sd_backend_is_cpu(request.compute_backend)) {
         return result;
     }
-    auto add                     = [](size_t a, size_t b) { return b > SIZE_MAX - a ? SIZE_MAX : a + b; };
-    const size_t missing         = compute_backend_alloc_size(states, true);
-    result.required_device_bytes = add(request.pending_allocation_bytes, missing);
-    result.required_budget_bytes = add(request.runtime_peak_bytes(), missing);
-    auto device                  = ggml_backend_get_device(request.compute_backend);
-    if (device != nullptr) {
+    auto add             = [](size_t a, size_t b) { return b > SIZE_MAX - a ? SIZE_MAX : a + b; };
+    const size_t missing = compute_backend_alloc_size(states, true);
+    // Backend scratch buffers and pipelines are not included in graph measurements.
+    constexpr size_t safety_margin = 512ULL * 1024ULL * 1024ULL;
+    result.required_device_bytes   = add(add(request.pending_allocation_bytes, missing), safety_margin);
+    result.required_budget_bytes   = add(request.runtime_peak_bytes(), missing);
+    auto available_device_bytes    = [&](ggml_backend_t backend) {
+        auto device = ggml_backend_get_device(backend);
+        if (device == nullptr) {
+            return SIZE_MAX;
+        }
         size_t free_bytes = 0, total_bytes = 0;
         ggml_backend_dev_memory(device, &free_bytes, &total_bytes);
-        if (free_bytes != 0 || total_bytes != 0) {
-            result.available_device_bytes = free_bytes;
+        const size_t weights_resident = compute_backend_resident_bytes(backend);
+        const size_t other_runtime    = other_runtime_resident_bytes(request.owner_id, backend);
+        const size_t resident         = add(weights_resident, add(other_runtime, request.runtime_resident_bytes));
+        if (log_details) {
+            LOG_WARN("model manager memory on %s: reported free %.2f MB / total %.2f MB, tracked weights %.2f MB / other runtime %.2f MB / current runtime %.2f MB",
+                        ggml_backend_name(backend),
+                        free_bytes / (1024.0 * 1024.0), total_bytes / (1024.0 * 1024.0),
+                        weights_resident / (1024.0 * 1024.0), other_runtime / (1024.0 * 1024.0),
+                        request.runtime_resident_bytes / (1024.0 * 1024.0));
         }
-    }
+        if (free_bytes == 0 && total_bytes == 0) {
+            return SIZE_MAX;
+        }
+        // Vulkan's heap budget subtraction can underflow when usage exceeds the budget.
+        if (total_bytes > 0 && free_bytes > total_bytes && sd_backend_is(backend, "Vulkan")) {
+            return size_t{0};
+        }
+        if (total_bytes > 0) {
+            free_bytes = std::min(free_bytes, resident < total_bytes ? total_bytes - resident : 0);
+        }
+        return free_bytes;
+    };
+    result.available_device_bytes = available_device_bytes(request.compute_backend);
     if (request.max_backend_bytes > 0) {
         const size_t resident         = add(compute_backend_resident_bytes(request.compute_backend),
                                             other_runtime_resident_bytes(request.owner_id, request.compute_backend));
@@ -1619,11 +1678,7 @@ ModelManager::CapacityCheck ModelManager::check_capacity(
     // GGML exposes only a split buffer's total size, not per-device allocations.
     // Charge that upper bound on every participant instead of undercounting a shard.
     for (const auto& entry : split_devices) {
-        size_t free_bytes = 0, total_bytes = 0;
-        ggml_backend_dev_memory(ggml_backend_get_device(entry.first), &free_bytes, &total_bytes);
-        if (free_bytes != 0 || total_bytes != 0) {
-            result.available_device_bytes = std::min(result.available_device_bytes, free_bytes);
-        }
+        result.available_device_bytes = std::min(result.available_device_bytes, available_device_bytes(entry.first));
         if (entry.second > 0) {
             const size_t resident         = add(compute_backend_resident_bytes(entry.first),
                                                 other_runtime_resident_bytes(request.owner_id, entry.first));
@@ -1739,12 +1794,18 @@ bool ModelManager::ensure_compute_backend_capacity(
         }
     }
 
-    const auto capacity = check_capacity(request, required_states);
-    LOG_WARN("model manager cannot make enough memory available on %s: need %.2f MB device / %.2f MB budget, available %.2f MB device / %.2f MB budget",
+    const auto capacity                = check_capacity(request, required_states, true);
+    const std::string available_device = capacity.available_device_bytes == SIZE_MAX
+                                             ? "unknown"
+                                             : sd_format("%.2f MB", capacity.available_device_bytes / (1024.0 * 1024.0));
+    const std::string available_budget = capacity.available_budget_bytes == SIZE_MAX
+                                             ? "unlimited"
+                                             : sd_format("%.2f MB", capacity.available_budget_bytes / (1024.0 * 1024.0));
+    LOG_WARN("model manager cannot make enough memory available on %s: need %.2f MB device / %.2f MB budget, available %s device / %s budget",
              ggml_backend_name(compute_backend),
              capacity.required_device_bytes / (1024.0 * 1024.0),
              capacity.required_budget_bytes / (1024.0 * 1024.0),
-             capacity.available_device_bytes / (1024.0 * 1024.0),
-             capacity.available_budget_bytes / (1024.0 * 1024.0));
+             available_device.c_str(),
+             available_budget.c_str());
     return false;
 }
