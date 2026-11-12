@@ -33,7 +33,7 @@ namespace sd {
         }
 
         bool parse(const std::string& raw_spec, std::string* error = nullptr);
-        // Empty *out means greedy capacity fill. False on unknown devices or all-zero ratios.
+        // Empty *out means proportional capacity placement. False on unknown devices or all-zero ratios.
         bool ratios_for_backends(SDBackendModule module,
                                  const std::vector<ggml_backend_t>& backends,
                                  std::vector<float>* out,

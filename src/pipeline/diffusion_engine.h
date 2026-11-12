@@ -11,6 +11,7 @@
 #include <optional>
 #include <set>
 #include <string>
+#include <unordered_map>
 #include <vector>
 
 #include "core/ggml_extend_backend.h"
@@ -21,22 +22,23 @@
 #include "model/adapter/lora.hpp"
 #include "model_builders.h"
 #include "model_manager.h"
+#include "runtime/generation_progress.h"
 #include "stable-diffusion.h"
 
 class RNG;
 struct Denoiser;
 struct LoraModel;
 struct ConditionerParams;
+class ConditioningCache;
 struct SDCondition;
 struct RefImageParams;
 namespace Wav2Vec2 {
     class Wav2Vec2ModelRunner;
 }
 
-extern const char* model_version_to_str[];
-
 static inline bool sd_version_supports_ref_latent_img_cfg(SDVersion version) {
     return version == VERSION_FLUX ||
+           version == VERSION_CHROMA ||
            sd_version_is_flux2(version) ||
            (sd_version_is_qwen_image(version) && version != VERSION_QWEN_IMAGE_2_1) ||
            sd_version_is_mage_flow(version) ||
@@ -48,6 +50,11 @@ static inline bool sd_version_supports_ref_latent_img_cfg(SDVersion version) {
 class StableDiffusionGGML {
 public:
     SDBackendManager backend_manager;
+    std::unordered_map<ggml_backend_t, bool> flash_attn_by_backend;
+    SDBackendAssignment flash_attn_assignment;
+    SDBackendAssignment conv_direct_assignment;
+    std::unordered_map<ggml_backend_t, bool> conv2d_direct_by_backend;
+    std::unordered_map<ggml_backend_t, bool> conv3d_direct_by_backend;
 
     SDVersion version;
     bool external_vae_is_invalid = false;
@@ -121,6 +128,7 @@ public:
         sd_ctx_params_t params{};
         std::list<std::string> strings;
         std::vector<sd_embedding_t> embeddings;
+        std::map<std::string, std::string> models;
         ModelLoader::FileId control_net_file = 0;
         bool use_tae                         = false;
         bool use_audio_vae                   = false;
@@ -133,7 +141,7 @@ public:
                                 &sd_ctx_params_t::clip_g_path, &sd_ctx_params_t::clip_vision_path,
                                 &sd_ctx_params_t::t5xxl_path, &sd_ctx_params_t::llm_path,
                                 &sd_ctx_params_t::llm_vision_path, &sd_ctx_params_t::diffusion_model_path,
-                                &sd_ctx_params_t::tokenizer,
+                                &sd_ctx_params_t::tokenizer, &sd_ctx_params_t::flash_attn_mode, &sd_ctx_params_t::conv_direct_mode,
                                 &sd_ctx_params_t::high_noise_diffusion_model_path, &sd_ctx_params_t::uncond_diffusion_model_path,
                                 &sd_ctx_params_t::embeddings_connectors_path, &sd_ctx_params_t::vae_path,
                                 &sd_ctx_params_t::audio_vae_path, &sd_ctx_params_t::taesd_path,
@@ -142,6 +150,7 @@ public:
                                 &sd_ctx_params_t::pulid_weights_path, &sd_ctx_params_t::tensor_type_rules,
                                 &sd_ctx_params_t::max_vram, &sd_ctx_params_t::backend,
                                 &sd_ctx_params_t::params_backend, &sd_ctx_params_t::split_mode,
+                                &sd_ctx_params_t::split_ratio,
                                 &sd_ctx_params_t::rpc_servers, &sd_ctx_params_t::model_args}) {
                 strings.emplace_back(SAFE_STR(initial.*member));
                 params.*member = strings.back().c_str();
@@ -162,13 +171,24 @@ public:
             use_audio_vae               = other.use_audio_vae;
             photomaker_source_available = other.photomaker_source_available;
             animatediff_loaded          = other.animatediff_loaded;
+            models                      = other.models;
         }
         ModelConfig& operator=(const ModelConfig&) = delete;
+
+        void record_model(const std::string& name, const std::string& path) {
+            if (path.empty()) {
+                models.erase(name);
+                return;
+            }
+            const auto separator = path.find_last_of("/\\");
+            models[name]         = separator == std::string::npos ? path : path.substr(separator + 1);
+        }
 
         void set_control_net(ModelLoader::FileId id, const std::string& path) {
             control_net_file = id;
             strings.push_back(path);
             params.control_net_path = strings.back().c_str();
+            record_model("control_net", path);
         }
     };
 
@@ -181,8 +201,10 @@ public:
     std::recursive_mutex execution_mutex;
     std::unique_ptr<ModelConfig> config_;
     RunnerState runner_state_;
-    bool conditioning_cache_allowed_ = false;
+    std::unique_ptr<ConditioningCache> conditioning_cache_;
+    std::vector<ModelManager::LoraSpec> conditioning_loras_;
     bool executing_ = false;
+    sd::GenerationProgress generation_progress;
 
     std::shared_ptr<Denoiser> denoiser;
     std::vector<float> file_alphas_cumprod;
@@ -238,6 +260,9 @@ public:
 
         explicit ExecutionScope(StableDiffusionGGML& sd)
             : operation(sd) {
+            if (operation.acquired) {
+                sd.generation_progress.report("preparing");
+            }
             ready = operation.acquired && sd.refresh_model_sources();
         }
 
@@ -338,6 +363,8 @@ public:
     bool build_extension_runners();
 
     bool validate_and_load_runners();
+    bool flash_attention_for(SDBackendModule module);
+    bool conv_direct_for(SDBackendModule module, bool conv3d);
 
     bool build_denoiser();
 
@@ -367,6 +394,8 @@ public:
     void lora_stat();
 
     bool apply_loras(const sd_lora_t* loras, uint32_t lora_count);
+
+    SDCondition get_learned_condition(const ConditionerParams& params);
 
     void reset_generation_extensions();
 
@@ -422,6 +451,10 @@ public:
                                 size_t total_steps,
                                 bool terminal_sigma_is_zero,
                                 int64_t* last_progress_us);
+
+    // set the kind of the control image of the next generations (ControlNet Union),
+    // false (after saying why) when the loaded ControlNet can't use it
+    bool set_control_type(sd_control_type_t type);
 
     void compute_sample_controls(const sd::Tensor<float>& control_image,
                                  const sd::Tensor<float>& noised_input,

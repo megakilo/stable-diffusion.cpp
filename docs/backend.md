@@ -129,9 +129,9 @@ warning.
 
 ### Split ratio control (`--split-ratio` / `--layer-split-ratio`)
 
-When distributing a module across multiple devices (`--backend "diffusion=cuda0&cuda1"`), by default `stable-diffusion.cpp` performs a greedy fill: it packs as many layers as fit into the primary device's remaining VRAM before spilling remaining layers onto subsequent devices.
+When distributing a module across multiple devices (`--backend "diffusion=cuda0&cuda1"`), by default `stable-diffusion.cpp` sizes slices proportionally to each device's available VRAM capacity.
 
-If the primary device has heavy compute buffer or workspace requirements (e.g. attention scratch space), greedy packing can leave insufficient VRAM on the primary device for execution, even when secondary devices have ample free memory.
+If the primary device has heavier non-block memory, compute buffer, or workspace requirements (e.g. attention scratch space or co-resident sub-runners), default capacity proportions can still leave insufficient VRAM on the primary device for execution while secondary devices have spare memory.
 
 `--split-ratio` (or `--layer-split-ratio`) provides fine-grained control over weight distribution across devices:
 
@@ -155,7 +155,7 @@ If the primary device has heavy compute buffer or workspace requirements (e.g. a
 
 Within ratio lists, `:`, `/`, or `&` can be used interchangeably as separators.
 
-In **layer split mode**, layers are assigned as contiguous per-device slices in `--backend` order. Cut points are chosen at transformer-block boundaries to match the target parameter-byte ratio while strictly obeying each device's available VRAM. If the requested ratio cannot fit, setup fails instead of falling back to greedy fill. In **row split mode**, the ratio sets the row-split buffer weights across devices and is not mixed with VRAM-based weights. Device names in a targeted spec must match the assigned backends; unknown names are an error. If unspecified, it defaults to greedy fill based on available VRAM.
+In **layer split mode**, layers are assigned as contiguous per-device slices in `--backend` order. Cut points are chosen at transformer-block boundaries to match the target parameter-byte ratio while strictly obeying each device's available VRAM. If the requested ratio cannot fit, setup fails instead of falling back to automatic capacity proportions. In **row split mode**, the ratio sets the row-split buffer weights across devices and is not mixed with VRAM-based weights. Device names in a targeted spec must match the assigned backends; unknown names are an error. If unspecified, it defaults to proportional placement based on available VRAM.
 
 ## Automatic placement (`--auto-fit on|off`)
 
@@ -165,7 +165,10 @@ regardless of argument order, even with `--auto-fit on`.
 
 Auto-fit preserves explicit `--backend` assignments, including per-module
 assignments and device lists. For modules without a runtime assignment, it chooses
-the GPU with the largest available memory budget (the first device on a tie).
+the discrete GPU with the largest positive memory budget (the first device on a
+tie), falling back to integrated GPUs when no discrete GPU has a positive budget.
+An integrated GPU's shared system memory does not give it priority over a discrete
+GPU. Explicit assignments such as `--backend Vulkan1` still select that device.
 It then derives parameter placements from the model metadata, each module's
 compute devices, and the remaining memory budgets. The chosen backend
 specifications are printed.
@@ -187,10 +190,15 @@ the runner's graph-cut capacity checks.
 Runtime capacity checks also leave 512 MiB of currently free device memory for
 backend scratch buffers and pipelines, including with explicit backend assignments.
 They cap free-memory reports by the device's total memory minus tracked
-resident allocations. Vulkan reports exceeding total memory are rejected because
-its heap-budget subtraction can underflow. Other backends use the cap instead of
-treating such reports as zero free memory. Failed checks log the reported free and
-total memory alongside tracked weight and runtime allocations.
+resident allocations. Vulkan reports exceeding total memory are rejected on
+discrete GPUs because its heap-budget subtraction can underflow. On integrated
+GPUs, a wrapped report triggers reclamation before the tracked estimate can be
+accepted, subject to the byte checks and configured budgets. Other backends use
+the cap instead of treating such reports as zero free memory. Failed checks log
+the reported free and total memory alongside tracked weight and runtime allocations.
+With `--mmap`, device-backed mappings count toward these budgets at their full
+mapped-file size, once per device buffer even when multiple parameter blocks
+share it. Mappings retained in the loader cache continue to count.
 
 Components are considered in `diffusion`, `te`, `vae` order so that repeatedly
 used diffusion weights have priority. Each component's weights use the first
@@ -205,8 +213,18 @@ GPU cache space follows the same component priority. Before a lower-priority
 component can become permanently resident, the planner leaves room for the full
 weights and estimated compute space of higher-priority offloaded components.
 If offloaded diffusion already needs the entire main GPU budget, TE and VAE also
-use offloaded parameters. Their GPU copies can then be released after their
-phases, leaving more room to reuse diffusion weights across sampling steps.
+use offloaded parameters. GPU copies remain cached across sampling steps while
+a component's execution is active and are released under memory pressure.
+Ending a component's execution releases its staged GPU copies, disk-backed
+weight buffers, temporary compute buffers and execution caches. Parameters
+assigned permanently to a backend remain resident. Hires model upscaling shares
+the runtime budget and can
+reclaim idle weight copies from other components.
+Reclamation releases idle compute buffers first, then cached weight allocations
+until the current work fits. Weights used by active computation or pending
+transfers stay protected.
+For CPU computation with disk-backed parameters, cached weights are released
+when execution ends so they do not accumulate in RAM across components.
 CPU parameter residency allows GPU weight caching; it does not force every
 weight to be copied again at every step.
 
@@ -241,6 +259,126 @@ component to CPU computation solely because its full weights exceed VRAM.
 If a VAE decode fails, decoding retries with spatial tiling even when `--auto-fit`
 is off; supported video decoders try temporal tiling first and can then add
 spatial tiling. Spatial retries use half-size tiles along each latent dimension.
+
+## Direct convolution (`--conv-direct on|off|auto`)
+
+`--conv-direct` defaults to `auto` and accepts module assignments for
+`diffusion`, `vae` (including preview VAE), and `controlnet`, using the same
+aliases and precedence rules as `--flash-attn`:
+
+```shell
+sd-cli -m model.safetensors -p "a cat" --conv-direct auto,vae=off
+sd-cli -m model.safetensors -p "a cat" --conv-direct off,diffusion=on
+```
+
+- `on` requests direct 2D and 3D convolution.
+- `off` uses the existing im2col-based convolution paths.
+- `auto` first checks support for a representative F16-weight/F32-input direct
+  convolution graph. Vulkan then benchmarks direct convolution against im2col
+  using two small shapes per dimension, with warmup, output validation, and five
+  interleaved measurements per shape. Direct convolution must improve the sum of
+  median times by at least 5%; a failed probe defaults to `off`.
+  Other backends retain their implicit GEMM checks without benchmarking:
+  CUDA 2D requires a compiled Turing-or-newer MMA architecture; HIP 2D requires
+  the supported CDNA MFMA or RDNA WMMA architectures described below for flash
+  attention. MUSA 2D has a SIMT implementation. CUDA, HIP, and MUSA 3D also have
+  a SIMT implementation, so they do not require MMA. Other backends default to
+  `off`. Results and decision logs are cached per compute backend and dimension
+  in the context, as with flash attention. Each dimension is selected independently,
+  and all compute devices in a module must qualify. Parameter-storage devices do
+  not affect this choice.
+
+These are backend-level defaults. GGML still chooses the actual kernel based on
+weight type, shape, and hardware; enabling direct convolution does not guarantee
+that every operation uses implicit GEMM. The CUDA-family implicit GEMM paths
+require F16 weights and can use ordinary direct kernels for other cases.
+For 3D convolution, a supported direct kernel is also used as a fallback when
+the im2col decomposition is unsupported for the actual tensor sizes, including
+when an intermediate reshape or matrix multiplication exceeds backend limits.
+This option does not change the separately created image upscaler context.
+
+Repeating `--conv-direct` replaces the previous assignment string. Existing
+`--diffusion-conv-direct` (diffusion and ControlNet) and `--vae-conv-direct`
+flags are deprecated and emit a warning, but remain supported when
+`--conv-direct` is omitted. Use `--conv-direct auto,diffusion=on,controlnet=on`
+and `--conv-direct auto,vae=on`, respectively. An explicit
+`--conv-direct` takes precedence over both legacy flags regardless of order.
+Library callers can set the appended `sd_ctx_params_t::conv_direct_mode` field
+to the same string; null or empty selects `auto` while honoring legacy true
+flags. The context copies the string.
+
+## Flash attention (`--flash-attn on|off|auto`)
+
+`--flash-attn` defaults to `auto`. Selection happens while creating the model
+context, before inference, and is cached once per compute backend in that context.
+Parameter-storage backends are not benchmarked.
+
+The option also accepts module assignments, using the same module aliases as
+`--backend`:
+
+```shell
+sd-cli -m model.safetensors -p "a cat" --flash-attn auto,te=off,vae=on
+sd-cli -m model.safetensors -p "a cat" --flash-attn off,diffusion=auto
+```
+
+Supported modules are `diffusion`, `te`, `clip_vision`, `vae`, `controlnet`, and
+`audio_encoder`. Modules without an assignment use the default (`auto` if no
+default is supplied). A bare mode or `all=`, `default=`, or `*=` sets the default;
+module-specific settings take precedence regardless of their position. Within
+one assignment string, the last setting for the same module or default wins.
+Repeating `--flash-attn` replaces the entire previous string.
+
+Only modules set to `auto` need backend probing. An explicit `on` or `off` for
+one module does not change another module's decision, even when they share a
+backend. Modules without configurable attention are rejected instead of silently
+ignoring their settings.
+
+- `on` requests flash attention for all models. Unsupported attention operations
+  still fall back to ordinary attention.
+- `off` disables flash attention, including the flash-attention fallback from
+  SageAttention. SageAttention itself remains controlled by `--sage-attn`.
+- `auto` enables CPU and supported CUDA MMA configurations without timing a
+  benchmark. CUDA uses both the device's capability and the compiled GGML
+  architectures. HIP also skips timing on known CDNA MFMA architectures
+  (`gfx908`, `gfx90a`, `gfx940`/`gfx941`/`gfx942`, `gfx950`) and RDNA 3/3.5/4
+  WMMA architectures (`gfx11xx`/`gfx12xx`). The CDNA shortcut requires
+  `GGML_HIP_MMQ_MFMA` to be enabled at build time. All shortcuts still check
+  support for the FA probe graph. Vulkan devices whose description identifies
+  NVIDIA RTX hardware (GeForce RTX, TITAN RTX, Quadro RTX and professional RTX)
+  also skip timing. This is a device-name heuristic and needs no CUDA runtime.
+  Unsupported graphs are disabled; other configurations, including older or
+  unknown HIP architectures and other Vulkan devices, are benchmarked.
+
+The probe compares ordinary and flash attention through the same attention
+builder used by models, including layout conversion and F16 conversion. It uses
+two small self-attention graphs (512 tokens with head size 64, and 1024 tokens
+with head size 128, both with four heads), checks their outputs, warms up each
+path, then alternates five synchronized measurements. Flash attention is enabled
+when the sum of its median times is at least 5% lower. These representative
+shapes are a startup heuristic, not a guarantee for every model or resolution.
+Allocation/execution failures and inconclusive probes select `off`. Timing stops
+starting new measurement pairs after one second of measured computation;
+backend initialization, warmup and an in-flight pair can take longer.
+
+Different modules can select different results. A multi-device model enables
+flash attention only if all of its compute devices select `on`, preserving the
+model's existing single boolean setting. This conservative rule also covers
+row-split configurations, which can fall back to layer split during initialization.
+
+`--fa` and `--diffusion-fa` are deprecated and emit a warning when used.
+Use `--flash-attn on` and `--flash-attn off,diffusion=on`, respectively.
+Both aliases write the same mode string as `--flash-attn`; the last occurrence
+of any of these options wins. Library callers
+can set `sd_ctx_params_t::flash_attn_mode` to the same string, including
+`"on"`, `"off"`, `"auto"`, or `"auto,te=off,vae=on"`.
+A null or empty string uses automatic selection unless a
+legacy `flash_attn` or `diffusion_flash_attn` boolean is set. The context copies
+the string; no new enum is required.
+
+```shell
+sd-cli -m model.safetensors -p "a cat" --flash-attn auto
+sd-cli -m model.safetensors -p "a cat" --flash-attn off
+```
 
 ## Modules
 

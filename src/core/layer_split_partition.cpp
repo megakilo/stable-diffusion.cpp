@@ -376,10 +376,13 @@ namespace sd {
         return backend_index == 0 ? primary_backend_vram_limit : 0;
     }
 
+    // Capacity of a device that reports no free memory and has no VRAM limit.
+    static constexpr int64_t graph_cut_layer_split_unknown_capacity = std::numeric_limits<int64_t>::max() / 4;
+
     static std::vector<int64_t> graph_cut_layer_split_backend_capacities(const std::vector<ggml_backend_t>& backends,
                                                                          const std::vector<size_t>& backend_vram_limits,
                                                                          size_t primary_backend_vram_limit) {
-        std::vector<int64_t> capacities(backends.size(), std::numeric_limits<int64_t>::max() / 4);
+        std::vector<int64_t> capacities(backends.size(), graph_cut_layer_split_unknown_capacity);
         constexpr int64_t compute_headroom_bytes = 2ll * 1024 * 1024 * 1024;
         for (size_t i = 0; i < backends.size(); i++) {
             ggml_backend_dev_t dev = ggml_backend_get_device(backends[i]);
@@ -398,6 +401,57 @@ namespace sd {
             }
         }
         return capacities;
+    }
+
+    // Whether filling the devices in order, each up to `fraction` of its capacity, places every
+    // segment. Mirrors the placement loop in partition_graph_cut_layer_split().
+    static bool graph_cut_layer_split_fits(const std::vector<int64_t>& segment_bytes,
+                                           const std::vector<int64_t>& capacities,
+                                           double fraction) {
+        size_t backend = 0;
+        int64_t used   = 0;
+        for (int64_t bytes : segment_bytes) {
+            while (backend + 1 < capacities.size() && bytes > 0 &&
+                   used + bytes > (int64_t)((double)capacities[backend] * fraction)) {
+                backend++;
+                used = 0;
+            }
+            if (bytes > 0 && used + bytes > (int64_t)((double)capacities[backend] * fraction)) {
+                return false;
+            }
+            used += bytes;
+        }
+        return true;
+    }
+
+    // Fill limits that size the contiguous ranges in proportion to the device capacities: the same
+    // fraction of every capacity, as small as possible while all segments still fit. Filling the
+    // first device up to its capacity would leave only the fixed headroom for compute, which is too
+    // small for large video graphs. A fraction of 1 is plain capacity-based placement, so every
+    // layout that fits the capacities is still found.
+    static std::vector<int64_t> graph_cut_layer_split_fill_limits(const std::vector<int64_t>& segment_bytes,
+                                                                  const std::vector<int64_t>& capacities) {
+        const bool capacities_known = std::all_of(capacities.begin(), capacities.end(), [](int64_t capacity) {
+            return capacity < graph_cut_layer_split_unknown_capacity;
+        });
+        if (!capacities_known || !graph_cut_layer_split_fits(segment_bytes, capacities, 1.0)) {
+            return capacities;
+        }
+        double low  = 0.0;
+        double high = 1.0;
+        for (int i = 0; i < 32; i++) {
+            const double mid = (low + high) / 2;
+            if (graph_cut_layer_split_fits(segment_bytes, capacities, mid)) {
+                high = mid;
+            } else {
+                low = mid;
+            }
+        }
+        std::vector<int64_t> limits(capacities.size());
+        for (size_t i = 0; i < capacities.size(); i++) {
+            limits[i] = (int64_t)((double)capacities[i] * high);
+        }
+        return limits;
     }
 
     bool partition_graph_cut_layer_split(const char* desc,
@@ -541,16 +595,16 @@ namespace sd {
                     LOG_ERROR("%s graph-cut layer split: requested split ratio cannot be satisfied within device VRAM capacities", desc);
                     return false;
                 }
-            }
-
-            if (!use_ratio_partition) {
-                size_t current_backend = 0;
-                int64_t current_used   = 0;
+            } else {
+                // Move to the next device at the proportional fill limit; the capacity stays the hard limit.
+                const std::vector<int64_t> backend_limits = graph_cut_layer_split_fill_limits(segment_param_bytes, backend_capacities);
+                size_t current_backend                    = 0;
+                int64_t current_used                      = 0;
                 for (size_t seg_idx = 0; seg_idx < plan.segments.size(); seg_idx++) {
                     int64_t bytes = segment_param_bytes[seg_idx];
                     while (current_backend + 1 < split_backends.size() &&
                            bytes > 0 &&
-                           current_used + bytes > backend_capacities[current_backend]) {
+                           current_used + bytes > backend_limits[current_backend]) {
                         current_backend++;
                         current_used = 0;
                     }
@@ -569,7 +623,11 @@ namespace sd {
             }
         }
 
+        ggml_backend_t last_reused_backend = split_backends[0];
         for (size_t seg_idx = 0; seg_idx < plan.segments.size(); seg_idx++) {
+            if (reuse_assignments && segment_params[seg_idx].empty()) {
+                backend_by_segment[seg_idx] = last_reused_backend;
+            }
             for (ggml_tensor* param : segment_params[seg_idx]) {
                 ggml_backend_t target_backend = backend_by_segment[seg_idx];
                 auto assigned_it              = param_assignments.find(param);
@@ -577,7 +635,7 @@ namespace sd {
                     param_assignments[param]            = target_backend;
                     assignment.has_new_param_assignment = true;
                 } else {
-                    target_backend = assigned_it->second;
+                    target_backend              = assigned_it->second;
                     backend_by_segment[seg_idx] = target_backend;
                 }
 
@@ -589,6 +647,9 @@ namespace sd {
                     return false;
                 }
                 size_t backend_idx = (size_t)std::distance(split_backends.begin(), backend_it);
+                if (reuse_assignments) {
+                    last_reused_backend = target_backend;
+                }
                 assignment.first_segment_by_backend[backend_idx] = std::min(assignment.first_segment_by_backend[backend_idx], seg_idx);
                 assignment.last_segment_by_backend[backend_idx]  = std::max(assignment.last_segment_by_backend[backend_idx], seg_idx + 1);
                 assignment.tensors_by_backend[backend_idx].push_back(param);
@@ -600,23 +661,23 @@ namespace sd {
         for (size_t seg_idx = 0; seg_idx < plan.segments.size(); seg_idx++) {
             ggml_backend_t backend = backend_by_segment[seg_idx];
             const auto& segment    = plan.segments[seg_idx];
-            for (int node_index : segment.internal_node_indices) {
+            auto assign_node       = [&](int node_index) {
                 if (node_index < 0 || node_index >= n_nodes) {
-                    continue;
+                    return;
                 }
                 ggml_tensor* node = ggml_graph_node(gf, node_index);
-                if (node != nullptr) {
+                if (node == nullptr) {
+                    return;
+                }
+                if (assignment.node_assignments.find(node) == assignment.node_assignments.end()) {
                     assignment.node_assignments[node] = backend;
                 }
+            };
+            for (int node_index : segment.internal_node_indices) {
+                assign_node(node_index);
             }
             for (int node_index : segment.output_node_indices) {
-                if (node_index < 0 || node_index >= n_nodes) {
-                    continue;
-                }
-                ggml_tensor* node = ggml_graph_node(gf, node_index);
-                if (node != nullptr) {
-                    assignment.node_assignments[node] = backend;
-                }
+                assign_node(node_index);
             }
         }
 
